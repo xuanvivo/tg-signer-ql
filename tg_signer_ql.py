@@ -78,6 +78,8 @@ NOTIFY_TITLE = "TG签到 (tg-signer)"
 LOG_PREFIX = re.compile(r"^\[\w+\]\s*\[tg-signer\]\s*[\d-]+\s[\d:,]+\s\S+\s\d+\s")
 TASK_PREFIX = re.compile(r"^账户「[^」]*」- 任务「[^」]*」:\s*")
 FAIL_MARK = re.compile(r"签到失败|Traceback|Unauthorized|EOFError|AUTH_KEY|SESSION_REVOKED", re.I)
+AUTH_DEAD = re.compile(r"AUTH_KEY_UNREGISTERED|AUTH_KEY_INVALID|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED", re.I)
+RE_EXC_LINE = re.compile(r"^[A-Za-z_][\w.]*: .+")  # Traceback 末尾的异常行
 
 RE_DONE = re.compile(r"处理完成: action=<SupportAction\.(\w+): \d+>(?:\s+(?:text|dice)='(.*)')?")
 RE_REPLY = re.compile(r"收到来自「(.+?)」的消息:\s*(.*)")
@@ -444,14 +446,44 @@ def run_account(account: str, session_string) -> tuple:
 
     ok = rc == 0 and not FAIL_MARK.search(out)
     events = summarize_output(out)
-    if "EOFError" in out:
+
+    if AUTH_DEAD.search(out):  # 会话已在服务端被注销（如手机上清了设备会话）
+        quarantined = quarantine_session(account, session_string)
+        tip = "🔑 该账号会话已被注销/失效，请重新运行扫码登录任务"
+        if quarantined:
+            tip += f"（已隔离失效会话文件 {quarantined}）"
+        elif session_string is not None and not account.startswith("qr_"):
+            tip += "，并更新/删除环境变量 TG_SESSION_STRING 里对应的串"
+        events.append(tip)
+    elif "EOFError" in out:
         events.append("🔑 会话缺失或已失效，请重新扫码（--qrlogin）或更新 TG_SESSION_STRING")
-    if not ok and not any(e.startswith("❌") for e in events):
-        tail = [ln for ln in out.strip().splitlines() if ln.strip()][-3:]
-        events.append("❌ 失败详情: " + " / ".join(ln.strip()[:80] for ln in tail))
+
+    if not ok and not any(e.startswith(("❌", "🔑")) for e in events):
+        exc = [ln.strip() for ln in out.splitlines()
+               if RE_EXC_LINE.match(ln.strip()) and not ln.strip().startswith("File ")]
+        if exc:
+            events.append("❌ " + exc[-1][:160])
+        else:
+            tail = [ln for ln in out.strip().splitlines() if ln.strip()][-3:]
+            events.append("❌ 失败详情: " + " / ".join(ln.strip()[:80] for ln in tail))
     if not events:
         events.append(f"（无关键输出，退出码 {rc}）")
     return ok, "\n".join(events)
+
+
+def quarantine_session(account: str, session_string) -> str:
+    """把已被服务端注销的会话文件改名隔离，避免每天反复撞 401。返回被隔离的文件名"""
+    if session_string is None:
+        f = SESSION_DIR / f"{account}.session"
+    elif account.startswith("qr_"):
+        f = SESSION_DIR / f"{account}.session_string"
+    else:
+        return ""  # 环境变量里的串，无文件可隔离
+    if f.exists():
+        dead = Path(str(f) + ".bad")
+        f.rename(dead)
+        return dead.name
+    return ""
 
 
 def send_notify(title: str, content: str):
@@ -694,11 +726,19 @@ async def _qr_login():
     print(f"已收集 {len(descs)} 个账号: {'、'.join(descs)}", flush=True)
     env_ss = os.environ.get("TG_SESSION_STRING", "").strip()
     if env_ss:
-        print(f"\n⚠️ 检测到已设置环境变量 TG_SESSION_STRING（它的优先级更高）。\n"
-              f"要让签到跑扫码收集的全部账号，请删除该变量，或把它的值更新为:\n{combined}", flush=True)
+        if interactive:
+            print(f"\n⚠️ 检测到已设置环境变量 TG_SESSION_STRING（它的优先级更高）。\n"
+                  f"要让签到跑扫码收集的全部账号，请删除该变量，或把它的值更新为:\n{combined}", flush=True)
+        else:
+            print("\n⚠️ 检测到已设置环境变量 TG_SESSION_STRING（它的优先级更高）。\n"
+                  "建议删除该变量，签到会自动使用扫码收集的全部账号。", flush=True)
     else:
         print("\n签到任务会自动使用以上账号，无需再配置任何变量。", flush=True)
-    print(f"{bar}\n备用: 本账号 session string（迁移或手动配置时才用得到，注意保密）:\n{ss}", flush=True)
+    if interactive:
+        print(f"{bar}\n备用: 本账号 session string（迁移或手动配置时才用得到，注意保密）:\n{ss}")
+    else:
+        print("（网页模式出于安全不在日志显示 session string；如确实需要该字符串，"
+              "请在容器终端运行 --qrlogin）", flush=True)
     print("\n再加一个账号：换个账号扫码，重新运行一次本任务/命令即可", flush=True)
 
 
