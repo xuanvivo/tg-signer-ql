@@ -1,0 +1,10 @@
+# 运行数据（含 session 秘钥，绝不能提交）
+tg_signer_data/
+*.session
+*.session_string
+qr_accounts.json
+.signer/
+
+__pycache__/
+*.pyc
+logs/
