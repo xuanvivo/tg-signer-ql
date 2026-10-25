@@ -2,9 +2,12 @@
 tg_signer_data/
 *.session
 *.session_string
+*.session.bad
+*.session_string.bad
 qr_accounts.json
 .signer/
 
 __pycache__/
 *.pyc
 logs/
+reward_rules.json

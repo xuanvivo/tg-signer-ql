@@ -60,6 +60,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -71,8 +73,8 @@ LOG_DIR = DATA_DIR / "logs"
 TASK_NAME = os.environ.get("TG_SIGN_TASK", "ql_sign").strip() or "ql_sign"
 DEFAULT_CHATS = "@githubghs_bot|/checkin"
 TIMEOUT = int(os.environ.get("TG_SIGN_TIMEOUT", "600") or 600)
-NUM_DIALOGS = os.environ.get("TG_SIGN_DIALOGS", "20").strip() or "20"
-NOTIFY_TITLE = "TG签到 (tg-signer)"
+NUM_DIALOGS = os.environ.get("TG_SIGN_DIALOGS", "100").strip() or "100"
+NOTIFY_TITLE = "📡 TG 签到"
 
 # tg-signer 日志前缀 / 「账户-任务」前缀，摘要时去掉
 LOG_PREFIX = re.compile(r"^\[\w+\]\s*\[tg-signer\]\s*[\d-]+\s[\d:,]+\s\S+\s\d+\s")
@@ -84,12 +86,97 @@ RE_EXC_LINE = re.compile(r"^[A-Za-z_][\w.]*: .+")  # Traceback 末尾的异常�
 RE_DONE = re.compile(r"处理完成: action=<SupportAction\.(\w+): \d+>(?:\s+(?:text|dice)='(.*)')?")
 RE_REPLY = re.compile(r"收到来自「(.+?)」的消息:\s*(.*)")
 ACTION_LABELS = {
-    "SEND_TEXT": "📨 已发送",
-    "SEND_DICE": "🎲 已发骰子",
-    "CLICK_KEYBOARD_BY_TEXT": "👆 已点击按钮",
-    "CHOOSE_OPTION_BY_IMAGE": "🖼 已完成图片选项",
-    "REPLY_BY_CALCULATION_PROBLEM": "🧮 已回复算术题",
+    "SEND_TEXT": ("📨", "发送"),
+    "SEND_DICE": ("🎲", "掷骰子"),
+    "CLICK_KEYBOARD_BY_TEXT": ("👆", "点击按钮"),
+    "CHOOSE_OPTION_BY_IMAGE": ("🖼", "图片选项"),
+    "REPLY_BY_CALCULATION_PROBLEM": ("🧮", "回复算术题"),
 }
+
+# ─────────────────── 机器人回复：英文措辞 -> 中文 ───────────────────
+# 按“长词优先”顺序替换，避免 point 抢在 total points 之前命中
+PHRASE_MAP = [
+    ("check-in successful", "签到成功"), ("checkin successful", "签到成功"),
+    ("sign-in successful", "签到成功"), ("signed in successfully", "签到成功"),
+    ("you have already checked in today", "今日已签到"),
+    ("you have already checked in", "今日已签到"), ("already checked in", "今日已签到"),
+    ("already signed in", "今日已签到"), ("come back tomorrow", "明天再来"),
+    ("check-in resets at", "签到重置于"), ("resets at", "重置于"),
+    ("next check-in", "下次签到"), ("next checkin", "下次签到"),
+    ("total points", "总积分"), ("total balance", "总余额"), ("current balance", "当前余额"),
+    ("please try again later", "请稍后重试"), ("try again later", "请稍后重试"),
+    ("consecutive days", "连续天数"), ("in a row", "连续"),
+    ("you earned", "获得"), ("you have earned", "获得"), ("you got", "获得"),
+    ("check-in", "签到"), ("checkin", "签到"), ("sign in", "签到"),
+    ("please click the button below", "请点击下方按钮"), ("click the button", "点击按钮"),
+    ("is ready", "已就绪"), ("daily", "每日"), ("weekly", "每周"), ("monthly", "每月"),
+    ("hello", "你好"), ("hi there", "你好"), ("please", "请"),
+    ("congratulations", "恭喜"), ("welcome back", "欢迎回来"),
+    ("credits", "服务额度"), ("credit", "服务额度"), ("points", "积分"), ("point", "积分"),
+    ("coins", "金币"), ("balance", "余额"), ("streak", "连续签到"), ("bonus", "奖励"),
+    ("tomorrow", "明天"), ("today", "今天"), ("yesterday", "昨天"),
+    ("hours", "小时"), ("hour", "小时"), ("minutes", "分钟"), ("minute", "分钟"),
+    ("days", "天"), ("day", "天"),
+    ("successful", "成功"), ("success", "成功"),
+    ("failed", "失败"), ("failure", "失败"), ("error", "错误"),
+    ("thank you", "谢谢"), ("your", "你的"), ("you", "你"),
+]
+
+REPLY_NUMBER = r"\d+(?:,\d{3})*(?:\.\d+)?"
+RE_EARNED = re.compile(
+    rf"(?:earned|gained|got|received)\s*\+?\s*({REPLY_NUMBER})"
+    rf"|\+\s*({REPLY_NUMBER})\s*(?:points?|credits?|coins?|硬币|金币|积分)"
+    rf"|获得\s*\+?\s*({REPLY_NUMBER})", re.I)
+RE_TOTAL = re.compile(
+    rf"(?:total|current|remaining)\s*(?:points?|balance|credits?|coins?)\s*[:：]?\s*({REPLY_NUMBER})"
+    rf"|(?:balance|总积分|总计|累计|当前积分|积分余额|平衡|余额)\s*[:：]?\s*({REPLY_NUMBER})", re.I)
+RE_NEXT = re.compile(
+    r"next\s*check-?in\s*[:：]?\s*([^✅🎉🎯💰📅🔥\n]+)"
+    r"|下次签到\s*[:：]?\s*([^✅🎉🎯💰📅🔥\n]+)"
+    r"|(?:check-?in\s*)?resets?\s*at\s*([^✅🎉🎯💰📅🔥\n]+)"
+    r"|签到(?:时间)?重置(?:于|时间)?\s*[:：]?\s*([^✅🎉🎯💰📅🔥\n]+)", re.I)
+RE_STREAK = re.compile(
+    r"(?:streak|consecutive)\D{0,12}?([\d,]+)|连续(?:签到)?\D{0,4}?([\d,]+)\s*天", re.I)
+RE_ALREADY = re.compile(r"already\s+(?:checked|signed)\s*in|今[天日]?已(?:经)?签到|重复签到|请勿重复", re.I)
+RE_OKMARK = re.compile(r"check-?in\s*success|sign-?in\s*success|签到成功|出席率\s*成功|successfully", re.I)
+RE_KEEPTOKEN = re.compile(r"[@/][A-Za-z0-9_\-]+")  # @用户名 / 命令，不参与翻译
+
+# 奖励和余额分别保留单位；同一机器人中的 points / credits 也不能混用。
+RE_REWARD_UNIT = re.compile(r"\b(?:points?|credits?|coins?)\b|积分|硬币|金币", re.I)
+RE_UNIT_AFTER_AMOUNT = re.compile(r"\s*(points?\b|credits?\b|coins?\b|积分|硬币|金币)", re.I)
+RE_USD_AFTER_UNIT = re.compile(r"\s*[|｜]\s*\$\s*(\d+(?:\.\d+)?)")
+REWARD_UNITS = {
+    "point": "积分", "points": "积分", "积分": "积分",
+    "credit": "服务额度", "credits": "服务额度",
+    "coin": "硬币", "coins": "硬币", "硬币": "硬币", "金币": "金币",
+}
+
+# Telegram 常见报错 -> 中文短语
+TG_ERRORS = [
+    ("PEER_ID_INVALID", "该账号没和这个聊天建立过会话（本地找不到对方）"),
+    ("USERNAME_NOT_OCCUPIED", "该 @用户名不存在"),
+    ("USERNAME_INVALID", "@用户名格式不对"),
+    ("USER_IS_BLOCKED", "你把对方拉黑了，先解除拉黑"),
+    ("CHAT_WRITE_FORBIDDEN", "没有在该聊天发言的权限"),
+    ("YOU_BLOCKED_USER", "你把对方拉黑了，先解除拉黑"),
+    ("BOT_METHOD_INVALID", "该操作不支持机器人账号"),
+    ("SLOWMODE_WAIT", "群组慢速模式限制，稍后再试"),
+    ("FLOOD_WAIT", "发送过于频繁被限流，稍后再试"),
+]
+RE_MISSING_PEER = re.compile(r"ID not found: (-?\d+)")
+
+
+def zh_fail(text: str) -> str:
+    """把 tg-signer 的失败行压缩成一句中文"""
+    for key, zh in TG_ERRORS:
+        if key in text:
+            return f"签到失败：{zh}（{key}）"
+    return re.sub(r"\s+", " ", text).strip()[:160]
+
+
+BAR = "━" * 22
+THIN = "─" * 22
+WEEKDAYS = "一二三四五六日"
 
 
 def ensure_dirs():
@@ -363,10 +450,102 @@ def account_label(account: str, session_string) -> str:
     return account
 
 
+def translate(text: str) -> str:
+    """把常见英文签到措辞替换为中文（保留 @用户名 / 命令原样）"""
+    keep = []
+
+    def stash(m):
+        keep.append(m.group(0))
+        return f"\x00{len(keep) - 1}\x00"
+
+    s = RE_KEEPTOKEN.sub(stash, text)
+    for en, zh in PHRASE_MAP:
+        s = re.sub(re.escape(en), zh, s, flags=re.I)
+    s = re.sub(r"\x00(\d+)\x00", lambda m: keep[int(m.group(1))], s)
+    s = re.sub(r"\s*([，。！？：、])\s*", r"\1", s)
+    s = re.sub(r"\s*,\s*(?=[一-鿿])", "，", s)          # 中文里的英文逗号
+    s = re.sub(r"\s*!\s*(?=[一-鿿])", "！", s)
+    s = re.sub(r"(?<=[一-鿿])\s+(?=[一-鿿])", "", s)  # 中文之间多余空格
+    s = re.sub(r"\s{2,}", " ", s).strip(" ！!。.·|")
+    return s
+
+
+def _num(m):
+    if not m:
+        return None
+    for g in m.groups():
+        if g:
+            return g.replace(",", "")
+    return None
+
+
+def parse_reply(text: str) -> dict:
+    """从回复提取奖励、余额及其单位，美元折算只使用机器人原文。"""
+    d = {}
+    if RE_ALREADY.search(text):
+        d["status"] = ("🔁", "今日已签到")
+    elif RE_OKMARK.search(text):
+        d["status"] = ("✅", "签到成功")
+    for key, rx in (("earned", RE_EARNED), ("total", RE_TOTAL), ("streak", RE_STREAK)):
+        match = rx.search(text)
+        v = _num(match)
+        if v is not None:
+            d[key] = v
+        if match and key in ("earned", "total"):
+            after = RE_UNIT_AFTER_AMOUNT.match(text, match.end())
+            unit = after or RE_REWARD_UNIT.search(match.group())
+            if unit:
+                d[key + "_unit"] = REWARD_UNITS[unit.group().strip().lower()]
+            # SheerID 原文同时给出硬币和美元折算；不套用固定汇率。
+            if d.get(key + "_unit") in ("硬币", "金币"):
+                usd = RE_USD_AFTER_UNIT.match(text, after.end() if after else match.end())
+                if usd:
+                    d[key + "_usd"] = usd.group(1)
+    m = RE_NEXT.search(text)
+    if m:
+        nxt = translate(next((g for g in m.groups() if g), "").strip())
+        nxt = nxt.strip(" ()（）·").replace("(", " ").replace(")", "").replace("（", " ").replace("）", "")
+        nxt = re.sub(r"^(?:in|after)\s+(.+)$", r"\1后", nxt, flags=re.I)  # in 24 hours -> 24 小时后
+        nxt = re.sub(r"\s{2,}", " ", nxt).strip()
+        if nxt:
+            d["next"] = nxt
+    return d
+
+
+def render_reply(ev: dict) -> list:
+    """机器人回复 -> 中文展示行"""
+    d, raw = ev["data"], ev["text"]
+    lines, parts = [], []
+    if d.get("status"):
+        lines.append(f"{d['status'][0]} {d['status'][1]}")
+    if d.get("earned"):
+        reward = f"🎁 本次 +{d['earned']}{d.get('earned_unit', '')}"
+        if d.get("earned_usd"):
+            reward += f"（约${d['earned_usd']}）"
+        parts.append(reward)
+    if d.get("total"):
+        balance = f"💰 回复时余额 {d['total']}{d.get('total_unit', '')}"
+        if d.get("total_usd"):
+            balance += f"（约${d['total_usd']}）"
+        parts.append(balance)
+    if d.get("streak"):
+        parts.append(f"🔥 连续 {d['streak']} 天")
+    if parts:
+        lines.append("   ".join(parts))
+    if d.get("next"):
+        lines.append(f"⏰ 下次 {d['next']}")
+    if len(lines) < 2:  # 结构化信息太少，补上翻译后的原文
+        zh = translate(raw)
+        if zh and zh not in lines:
+            lines.append(zh)
+    return lines or ["(非文本消息)"]
+
+
 def summarize_output(out: str) -> list:
-    """把 tg-signer 原始日志浓缩成人类友好的事件行"""
+    """把 tg-signer 原始日志浓缩成结构化事件"""
     events = []
     reply = None  # (来源, [内容片段])
+    seen = set()
 
     def flush():
         nonlocal reply
@@ -374,11 +553,13 @@ def summarize_output(out: str) -> list:
             frm, pieces = reply
             content = re.sub(r"\s+", " ", " ".join(p for p in pieces if p)).strip()
             content = content.rstrip(" |").strip() or "(非文本消息)"
-            if len(content) > 200:
-                content = content[:200] + "…"
-            line = f"🤖 {frm}: {content}"
-            if line not in events:  # 消息被编辑时会重复上报，去重
-                events.append(line)
+            if len(content) > 300:
+                content = content[:300] + "…"
+            key = (frm, content)
+            if key not in seen:  # 消息被编辑时会重复上报，去重
+                seen.add(key)
+                events.append({"t": "reply", "from": frm, "text": content,
+                               "data": parse_reply(content)})
             reply = None
 
     for ln in out.splitlines():
@@ -409,23 +590,56 @@ def summarize_output(out: str) -> list:
 
         m = RE_DONE.match(c)
         if m:
-            label = ACTION_LABELS.get(m.group(1), "✔ " + m.group(1))
-            events.append(f"{label}: {m.group(2)}" if m.group(2) else label)
+            icon, label = ACTION_LABELS.get(m.group(1), ("✔", m.group(1)))
+            events.append({"t": "action", "icon": icon, "label": label, "text": m.group(2) or ""})
             continue
         if c.startswith("签到失败"):
-            events.append("❌ " + c)
+            events.append({"t": "error", "text": zh_fail(c)})
         elif c.startswith("等待超时"):
-            events.append("⚠️ 等待回复超时（未匹配到按钮/新消息）")
+            events.append({"t": "warn", "text": "等待回复超时（未匹配到按钮/新消息）"})
     flush()
     return events
 
 
+def render_events(events: list) -> list:
+    """结构化事件 -> 通知里的正文行（已带缩进）"""
+    lines = []
+    for ev in events:
+        t = ev["t"]
+        if t == "action":
+            tail = f" {ev['text']}" if ev["text"] else ""
+            lines.append(f"  {ev['icon']} {ev['label']}{tail}")
+        elif t == "reply":
+            lines.append(f"  💬 {ev['from']}")
+            lines += [f"     {ln}" for ln in render_reply(ev)]
+        elif t == "warn":
+            lines.append(f"  {ev.get('icon', '⚠️')} {ev['text']}")
+        elif t == "error":
+            lines.append(f"  {ev.get('icon', '❌')} {ev['text']}")
+        else:
+            lines += [f"  ℹ️ {ln}" if i == 0 else f"     {ln}"
+                      for i, ln in enumerate(str(ev["text"]).splitlines())]
+    return lines
+
+
+def sum_earned(events: list) -> int:
+    total = 0
+    for ev in events:
+        if ev["t"] == "reply" and ev["data"].get("earned"):
+            try:
+                total += int(ev["data"]["earned"])
+            except ValueError:
+                pass
+    return total
+
+
 def run_account(account: str, session_string) -> tuple:
-    """执行一次签到，返回 (是否成功, 摘要文本)"""
+    """执行一次签到，返回 (是否成功, 事件列表)"""
     if session_string is None and not (SESSION_DIR / f"{account}.session").exists():
         guide = LOGIN_GUIDE.format(script=Path(__file__).name, account=account)
         print(guide)
-        return False, guide
+        return False, [{"t": "error", "icon": "🔑", "text": "尚未登录该账号"},
+                       {"t": "info", "text": guide}]
 
     cmd = base_cmd() + ["-a", account, "run-once", TASK_NAME, "-n", NUM_DIALOGS]
     try:
@@ -438,7 +652,8 @@ def run_account(account: str, session_string) -> tuple:
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or "") if isinstance(e.stdout, str) else ""
         print(out)
-        return False, f"执行超时（>{TIMEOUT}s），请检查网络/代理(TG_PROXY)"
+        return False, [{"t": "error", "text": f"执行超时（超过 {TIMEOUT}s）"},
+                       {"t": "info", "text": "请检查网络或代理设置 TG_PROXY"}]
 
     print(out)
     if "TgCrypto is missing" in out:
@@ -449,26 +664,35 @@ def run_account(account: str, session_string) -> tuple:
 
     if AUTH_DEAD.search(out):  # 会话已在服务端被注销（如手机上清了设备会话）
         quarantined = quarantine_session(account, session_string)
-        tip = "🔑 该账号会话已被注销/失效，请重新运行扫码登录任务"
+        tip = "会话已被注销/失效，请重新运行扫码登录任务"
         if quarantined:
             tip += f"（已隔离失效会话文件 {quarantined}）"
         elif session_string is not None and not account.startswith("qr_"):
             tip += "，并更新/删除环境变量 TG_SESSION_STRING 里对应的串"
-        events.append(tip)
+        events.append({"t": "error", "icon": "🔑", "text": tip})
     elif "EOFError" in out:
-        events.append("🔑 会话缺失或已失效，请重新扫码（--qrlogin）或更新 TG_SESSION_STRING")
+        events.append({"t": "error", "icon": "🔑",
+                       "text": "会话缺失或已失效，请重新扫码（--qrlogin）或更新 TG_SESSION_STRING"})
 
-    if not ok and not any(e.startswith(("❌", "🔑")) for e in events):
+    if "PEER_ID_INVALID" in out:  # 该账号本地没有这个 peer 的 access_hash
+        missing = sorted(set(RE_MISSING_PEER.findall(out)))
+        who = "、".join(missing) if missing else "目标聊天"
+        events.append({"t": "info", "text":
+                       f"用本账号在 Telegram 里给 {who} 先发一条 /start（每个账号都要发一次），"
+                       f"或把 TG_SIGN_DIALOGS 调大（当前 {NUM_DIALOGS}）后重跑"})
+
+    if not ok and not any(e["t"] == "error" for e in events):
         exc = [ln.strip() for ln in out.splitlines()
                if RE_EXC_LINE.match(ln.strip()) and not ln.strip().startswith("File ")]
         if exc:
-            events.append("❌ " + exc[-1][:160])
+            events.append({"t": "error", "text": exc[-1][:160]})
         else:
             tail = [ln for ln in out.strip().splitlines() if ln.strip()][-3:]
-            events.append("❌ 失败详情: " + " / ".join(ln.strip()[:80] for ln in tail))
+            events.append({"t": "error", "text": "失败详情 " + " / ".join(
+                ln.strip()[:80] for ln in tail)})
     if not events:
-        events.append(f"（无关键输出，退出码 {rc}）")
-    return ok, "\n".join(events)
+        events.append({"t": "warn", "text": f"无关键输出（退出码 {rc}）"})
+    return ok, events
 
 
 def quarantine_session(account: str, session_string) -> str:
@@ -486,6 +710,119 @@ def quarantine_session(account: str, session_string) -> str:
     return ""
 
 
+def fmt_dur(sec: float) -> str:
+    if sec < 60:
+        return f"{sec:.1f} 秒"
+    m, s = divmod(int(sec), 60)
+    return f"{m} 分 {s} 秒"
+
+
+def now_line() -> str:
+    n = datetime.now()
+    return f"{n:%m-%d} 周{WEEKDAYS[n.weekday()]} {n:%H:%M}"
+
+
+def verdict_of(rows: list) -> tuple:
+    """(总体结论, 成功数, 总数)"""
+    total = len(rows)
+    ok_n = sum(1 for r in rows if r["ok"])
+    if total and ok_n == total:
+        return "✅ 全部成功", ok_n, total
+    if ok_n == 0:
+        return "❌ 全部失败", ok_n, total
+    return "⚠️ 部分成功", ok_n, total
+
+
+def notice_text(text: str, limit: int = 40) -> str:
+    """通知只留一行短句；完整回复和报错仍在任务日志里。"""
+    text = re.sub(r"[━─═│╔╗╚╝╟╢╠╣]+", " ", str(text))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def compact_line(r: dict, skip_next: bool = False):
+    """每个账号一行，按机器人汇总最后一条回复和异常。"""
+    names = {"gemini_plusv_bot": "Gemini", "sheeridverifier_bot": "SheerID"}
+    replies = {e["from"]: e for e in r["events"] if e["t"] == "reply"}
+    bits = []
+    for source, ev in replies.items():
+        username = source.lstrip("@")
+        name = names.get(username.lower(), username.removesuffix("_bot"))
+        d = ev["data"]
+        status = d.get("status")
+        if status and status[0] == "🔁":
+            result = "已签"
+        elif status:
+            unit = d.get("earned_unit", "奖励")
+            result = f"{unit}+{d['earned']}" if d.get("earned") else "成功"
+            if d.get("earned_usd"):
+                result += f"≈${d['earned_usd']}"
+        else:
+            result = notice_text(translate(ev["text"]), 32)
+        if status and d.get("total"):
+            balance_unit = d.get("total_unit", "")
+            if status[0] != "🔁" and balance_unit == d.get("earned_unit"):
+                balance_unit = ""
+            result += f"（余额{d['total']}{balance_unit}"
+            if d.get("total_usd"):
+                result += f"≈${d['total_usd']}"
+            result += "）"
+        bits.append(f"{name} {result}")
+    for ev in r["events"]:
+        if ev["t"] in ("warn", "error"):
+            icon = "❌" if ev["t"] == "error" else "⚠️"
+            detail = f"{icon} {notice_text(zh_fail(ev['text']))}"
+            if detail not in bits:
+                bits.append(detail)
+    if not bits:
+        bits.append("⚠️ 未收到回复" if r["ok"] else "❌ 失败，详见任务日志")
+    elif not r["ok"] and not any(ev["t"] == "error" for ev in r["events"]):
+        bits.append("❌ 执行失败，详见任务日志")
+    return f"{r['label']}：" + "｜".join(bits)
+
+
+def common_next(rows: list) -> str:
+    """所有账号的下次签到时间一致时提到页脚，避免每行重复"""
+    vals = {e["data"].get("next") for r in rows for e in r["events"] if e["t"] == "reply"}
+    vals.discard(None)
+    return vals.pop() if len(vals) == 1 else ""
+
+
+def render_report(rows: list, targets: list, elapsed: float, reward_context=None) -> str:
+    """总结果加每账号一行，具体动作和原始回复留在日志。"""
+    verdict, ok_n, total = verdict_of(rows)
+    if reward_context is not None:
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        from tg_rewards import render_report as render_exchange_report
+        report = render_exchange_report(rows, reward_context, f"{verdict} {ok_n}/{total}")
+        extras = []
+        for row in rows:
+            for ev in row['events']:
+                if ev['t'] in ('warn', 'error'):
+                    icon = '❌' if ev['t'] == 'error' else '⚠️'
+                    extras.append(f"{row['label']}：{icon} {notice_text(zh_fail(ev['text']))}")
+            unknown = [ev for ev in row['events'] if ev['t'] == 'reply' and ev['from'].lstrip('@').lower() not in reward_context['bots']]
+            if unknown:
+                extras.append(compact_line({**row, 'events': unknown}))
+        return '\n'.join([report] + extras)
+    lines = [f"{verdict} {ok_n}/{total}"] + [compact_line(r) for r in rows]
+    sources = {e["from"].lstrip("@").lower() for r in rows for e in r["events"] if e["t"] == "reply"}
+    notes = []
+    if "gemini_plusv_bot" in sources:
+        notes.append("Gemini积分兑换机器人服务额度")
+    if "sheeridverifier_bot" in sources:
+        notes.append("SheerID硬币支付验证等服务，美元为站内折算")
+    if notes:
+        lines += ["用途：" + "；".join(notes), "余额以本次回复为准"]
+    return "\n".join(lines)
+
+
+def render_notice(msg: str) -> str:
+    """任务没跑起来时只推送简短原因。"""
+    return f"❌ TG 签到未执行\n{notice_text(msg, 100)}\n详情见任务日志"
+
+
 def send_notify(title: str, content: str):
     if os.environ.get("TG_SIGN_NOTIFY", "true").lower() in ("false", "0", "no"):
         return
@@ -501,7 +838,7 @@ def send_notify(title: str, content: str):
 
 def fail_exit(msg: str):
     print(msg)
-    send_notify(NOTIFY_TITLE, msg)
+    send_notify(NOTIFY_TITLE, render_notice(msg))
     sys.exit(1)
 
 
@@ -770,12 +1107,14 @@ def main():
                       "删除该变量即可改用全部扫码账号")
     raw = os.environ.get("TG_SIGN_CHATS", "").strip()
     cfg_file = WORKDIR / "signs" / TASK_NAME / "config.json"
+    targets = []
 
     if raw or not cfg_file.exists():
         try:
             chats = parse_chats(raw or DEFAULT_CHATS)
         except (ValueError, TypeError) as e:
             fail_exit(f"TG_SIGN_CHATS 配置有误: {e}")
+        targets = [str(c["chat_id"]) for c in chats]
         chats, unresolved = resolve_usernames(chats, accounts)
         if unresolved:
             fail_exit(
@@ -789,19 +1128,29 @@ def main():
         print(f"已生成配置: {cfg_file}")
     else:
         print(f"使用已有任务配置: {cfg_file}")
+        try:
+            targets = [str(c.get("chat_id")) for c in
+                       json.loads(cfg_file.read_text(encoding="utf-8")).get("chats", [])]
+        except Exception:
+            targets = []
 
-    results, all_ok = [], True
+    rows, all_ok = [], True
+    t0 = time.monotonic()
     for account, ss in accounts:
         print(f"\n========== 账号「{account}」 ==========")
-        ok, summary = run_account(account, ss)
+        ok, events = run_account(account, ss)
         all_ok = all_ok and ok
-        label = account_label(account, ss)  # 运行后 me.json 已生成，可取到真实用户名
-        body = "\n".join("  " + ln for ln in summary.splitlines())
-        results.append(f"👤 {label} — {'✅ 成功' if ok else '❌ 失败'}\n{body}")
+        # 运行后 me.json 已生成，可取到真实用户名
+        rows.append({"label": account_label(account, ss), "ok": ok, "events": events})
 
-    content = "\n\n".join(results)
-    print("\n" + "=" * 34 + "\n" + content)
-    send_notify(NOTIFY_TITLE, content)
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from tg_rewards import collect_context
+    reward_context = collect_context(accounts, rows, sys.modules[__name__])
+    content = render_report(rows, targets, time.monotonic() - t0, reward_context)
+    verdict, ok_n, total = verdict_of(rows)
+    print("\n" + content)
+    send_notify(f"{NOTIFY_TITLE} · {verdict} {ok_n}/{total}", content)
     sys.exit(0 if all_ok else 1)
 
 
